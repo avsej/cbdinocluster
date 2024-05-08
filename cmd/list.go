@@ -57,6 +57,50 @@ var listCmd = &cobra.Command{
 			clusters = append(clusters, clusterInfo)
 		}
 
+		outputJson, _ := cmd.Flags().GetBool("json")
+		if outputJson {
+			type ClusterListOutput_Node struct {
+				ID         string `json:"id"`
+				Name       string `json:"name"`
+				IPAddress  string `json:"ip_address"`
+				ResourceID string `json:"resource_id"`
+			}
+
+			type ClusterListOutput_Item struct {
+				ID       string                   `json:"id"`
+				State    string                   `json:"state"`
+				Expiry   *time.Time               `json:"expiry,omitempty"`
+				Deployer string                   `json:"deployer"`
+				Nodes    []ClusterListOutput_Node `json:"nodes"`
+			}
+
+			type ClusterListOutput []ClusterListOutput_Item
+
+			var out ClusterListOutput
+			for _, cluster := range clusters {
+				clusterItem := ClusterListOutput_Item{
+					ID:       cluster.Info.GetID(),
+					State:    cluster.Info.GetState(),
+					Deployer: cluster.DeployerName,
+				}
+				expiry := cluster.Info.GetExpiry()
+				if !expiry.IsZero() {
+					clusterItem.Expiry = &expiry
+				}
+				for _, node := range cluster.Info.GetNodes() {
+					clusterItem.Nodes = append(clusterItem.Nodes, ClusterListOutput_Node{
+						ID:         node.GetID(),
+						Name:       node.GetName(),
+						IPAddress:  node.GetIPAddress(),
+						ResourceID: node.GetResourceID(),
+					})
+				}
+				out = append(out, clusterItem)
+
+			}
+			helper.OutputJson(out)
+			return
+		}
 		fmt.Printf("Clusters:\n")
 		for _, clusterInfo := range clusters {
 			deployerName := clusterInfo.DeployerName
