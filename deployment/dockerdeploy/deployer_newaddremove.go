@@ -750,6 +750,22 @@ func (d *Deployer) addRemoveNodes(
 		nodeOtpsBeingRemoved = append(nodeOtpsBeingRemoved, node.OTPNode)
 	}
 
+	// Since we deployed new node containers and registered them via addNode, the
+	// existing clusterInfo struct is stale. We must re-fetch the latest cluster state
+	// so that reconcileRebalance receives up-to-date IP addresses (allNodeAddresses)
+	// and checks post-upgrade balance status correctly.
+	latestCluster, err := d.getCluster(ctx, clusterInfo.ClusterID)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get latest cluster info before rebalance reconciliation")
+	}
+
+	latestClusterInfoEx, err := d.getClusterInfoEx(ctx, latestCluster)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get latest cluster info ex before rebalance reconciliation")
+	}
+
+	clusterInfo = latestClusterInfoEx
+
 	d.logger.Debug("performing rebalance reconciliation")
 
 	err = d.reconcileRebalance(ctx, clusterInfo, nodeOtpsBeingRemoved)

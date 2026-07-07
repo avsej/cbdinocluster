@@ -3,6 +3,7 @@ package dockerdeploy
 import (
 	"context"
 	"fmt"
+	"net"
 	"slices"
 	"strings"
 	"time"
@@ -172,7 +173,63 @@ type nodeInfoEx struct {
 	ClusterNeedsRebalance bool
 }
 
-func (d *Deployer) getNodeInfoEx(ctx context.Context, nodeInfo *nodeInfo) (*nodeInfoEx, error) {
+type clusterState struct {
+	nodes          map[string]clustercontrol.ClusterNode
+	orchestrator   string
+	needsRebalance bool
+}
+
+func (d *Deployer) fetchClusterState(ctx context.Context, nodes []*nodeInfo) *clusterState {
+	// Attempt to pre-fetch cluster state by querying the active cluster manager
+	// from any available, responsive node in the cluster.
+	for _, node := range nodes {
+		if !node.IsClusterNode() {
+			continue
+		}
+		// Wrap probing in an immediately-invoked function expression (IIFE)
+		// to safely scope and cancel the context within each loop iteration.
+		state := func() *clusterState {
+			probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+
+			nodeCtrl := clustercontrol.NodeManager{
+				Logger:   d.logger,
+				Endpoint: fmt.Sprintf("http://%s:8091", node.IPAddress),
+			}
+			// Retrieve the list of all cluster nodes and their service map
+			clusterNodes, err := nodeCtrl.Controller().GetClusterNodes(probeCtx)
+			if err != nil {
+				return nil
+			}
+			// Retrieve orchestrator and rebalance status
+			terse, err := nodeCtrl.Controller().GetTerseClusterInfo(probeCtx)
+			if err != nil {
+				return nil
+			}
+
+			state := &clusterState{
+				nodes:          make(map[string]clustercontrol.ClusterNode),
+				orchestrator:   terse.Orchestrator,
+				needsRebalance: !terse.IsBalanced,
+			}
+			for _, cn := range clusterNodes {
+				ip := cn.Hostname
+				// Strip port cleanly, supporting both IPv4 and IPv6 formats.
+				if host, _, err := net.SplitHostPort(ip); err == nil {
+					ip = host
+				}
+				state.nodes[ip] = cn
+			}
+			return state
+		}()
+		if state != nil {
+			return state // Successfully fetched from a responsive node
+		}
+	}
+	return nil // Return nil if no nodes are responsive, falling back to local queries
+}
+
+func (d *Deployer) getNodeInfoEx(ctx context.Context, nodeInfo *nodeInfo, state *clusterState) (*nodeInfoEx, error) {
 	nodeEx := &nodeInfoEx{
 		nodeInfo: *nodeInfo,
 	}
@@ -181,41 +238,55 @@ func (d *Deployer) getNodeInfoEx(ctx context.Context, nodeInfo *nodeInfo) (*node
 		return nodeEx, nil
 	}
 
+	// 1. Efficient Path: If state is pre-fetched and contains this node, use it directly!
+	// This reduces HTTP overhead to a single happy-path call per cluster instead of O(N) sequential calls.
+	if state != nil {
+		if cn, ok := state.nodes[nodeInfo.IPAddress]; ok {
+			nodeEx.Status = cn.Status
+			nodeEx.OTPNode = cn.OTPNode
+			services, err := clusterdef.NsServicesToServices(cn.Services)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to generate services list")
+			}
+			nodeEx.Services = services
+			nodeEx.ClusterNeedsRebalance = state.needsRebalance
+			nodeEx.IsClusterOrchestrator = (state.orchestrator == cn.OTPNode)
+			d.logger.Debug("populated node info via pre-fetched cluster-state",
+				zap.String("node", nodeInfo.Name),
+				zap.String("otp_node", nodeEx.OTPNode),
+				zap.Bool("is_orchestrator", nodeEx.IsClusterOrchestrator))
+			return nodeEx, nil
+		}
+	}
+
+	// 2. Fallback Path: Query local API (e.g. for a newly added node not yet in cluster state)
 	nodeCtrl := clustercontrol.NodeManager{
 		Logger:   d.logger,
 		Endpoint: fmt.Sprintf("http://%s:8091", nodeInfo.IPAddress),
 	}
 
 	thisNodeInfo, err := nodeCtrl.Controller().GetLocalInfo(ctx)
-	if err != nil {
-		// there are cases where we want to fetch extended cluster information while
-		// one of the nodes will not respond to this endpoint so we consider this non-fatal
-		// and do not include the error to avoid spamming the logs.
-		d.logger.Info("failed to get extended node info, skipping",
-			zap.String("node", nodeInfo.Name))
-		return nodeEx, nil
+	if err == nil {
+		terseClusterInfo, err := nodeCtrl.Controller().GetTerseClusterInfo(ctx)
+		if err == nil {
+			services, err := clusterdef.NsServicesToServices(thisNodeInfo.Services)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to generate services list")
+			}
+			nodeEx.Status = thisNodeInfo.Status
+			nodeEx.OTPNode = thisNodeInfo.OTPNode
+			nodeEx.Services = services
+			nodeEx.ClusterNeedsRebalance = !terseClusterInfo.IsBalanced
+			nodeEx.IsClusterOrchestrator = (terseClusterInfo.Orchestrator == thisNodeInfo.OTPNode)
+			return nodeEx, nil
+		}
 	}
 
-	terseClusterInfo, err := nodeCtrl.Controller().GetTerseClusterInfo(ctx)
-	if err != nil {
-		// there are cases where we want to fetch extended cluster information while
-		// one of the nodes will not respond to this endpoint so we consider this non-fatal
-		d.logger.Info("failed to get terse cluster info, skipping",
-			zap.String("node", nodeInfo.Name))
-		return nodeEx, nil
-	}
-
-	services, err := clusterdef.NsServicesToServices(thisNodeInfo.Services)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to generate services list")
-	}
-
-	nodeEx.Status = thisNodeInfo.Status
-	nodeEx.OTPNode = thisNodeInfo.OTPNode
-	nodeEx.Services = services
-	nodeEx.ClusterNeedsRebalance = !terseClusterInfo.IsBalanced
-	nodeEx.IsClusterOrchestrator = (terseClusterInfo.Orchestrator == thisNodeInfo.OTPNode)
-
+	// There are cases where we want to fetch extended cluster information while
+	// one of the nodes will not respond to this endpoint (e.g., during upgrades/reboots).
+	// We consider this non-fatal and do not include the error to avoid spamming the logs.
+	d.logger.Info("failed to get extended node info, skipping",
+		zap.String("node", nodeInfo.Name))
 	return nodeEx, nil
 }
 
@@ -224,8 +295,10 @@ func (d *Deployer) getClusterInfoEx(ctx context.Context, clusterInfo *clusterInf
 		clusterInfo: *clusterInfo,
 	}
 
+	state := d.fetchClusterState(ctx, cluster.Nodes)
+
 	for _, node := range cluster.Nodes {
-		nodeEx, err := d.getNodeInfoEx(ctx, node)
+		nodeEx, err := d.getNodeInfoEx(ctx, node, state)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to get extended node info")
 		}

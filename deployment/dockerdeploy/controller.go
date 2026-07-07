@@ -15,6 +15,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	units "github.com/docker/go-units"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
@@ -1039,7 +1040,14 @@ func (c *Controller) RemoveNode(ctx context.Context, containerID string) error {
 		Timeout: ptr.To(0),
 	})
 	if err != nil {
-		return errors.Wrap(err, "failed to stop container")
+		// If the container is already stopped, deleted, or gone (e.g. during dynamic scaling,
+		// rolling upgrades, or chaos testing), we handle this gracefully to ensure the 
+		// node removal path is idempotent.
+		if errdefs.IsNotFound(err) || strings.Contains(strings.ToLower(err.Error()), "no such container") {
+			logger.Info("container already gone or not found while stopping, proceeding with cleanup")
+		} else {
+			return errors.Wrap(err, "failed to stop container")
+		}
 	}
 
 	logger.Debug("removing container")
@@ -1049,9 +1057,15 @@ func (c *Controller) RemoveNode(ctx context.Context, containerID string) error {
 		Force: true,
 	})
 	if err != nil {
-		lowerText := strings.ToLower(err.Error())
-		if !strings.Contains(lowerText, "already in progress") {
-			return errors.Wrap(err, "failed to remove container")
+		// Similarly, if the container was already cleaned up or removed, we log it and
+		// continue with metadata cleanup instead of propagating it as a fatal error.
+		if errdefs.IsNotFound(err) || strings.Contains(strings.ToLower(err.Error()), "no such container") {
+			logger.Info("container already gone or not found while removing, proceeding with cleanup")
+		} else {
+			lowerText := strings.ToLower(err.Error())
+			if !strings.Contains(lowerText, "already in progress") {
+				return errors.Wrap(err, "failed to remove container")
+			}
 		}
 	}
 

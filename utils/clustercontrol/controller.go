@@ -458,6 +458,27 @@ func (c *Controller) AddNode(ctx context.Context, opts *AddNodeOptions) error {
 	return c.doFormPost(ctx, path, form, true, nil)
 }
 
+// ClusterNode represents node metadata returned in the /pools/default node list.
+type ClusterNode struct {
+	OTPNode  string   `json:"otpNode"`
+	Hostname string   `json:"hostname"`
+	Status   string   `json:"status"`
+	Services []string `json:"services"`
+}
+
+// GetClusterNodes retrieves the metadata (status, services, OTP name) for all
+// nodes currently known to the cluster by querying the /pools/default endpoint.
+func (c *Controller) GetClusterNodes(ctx context.Context) ([]ClusterNode, error) {
+	var resp struct {
+		Nodes []ClusterNode `json:"nodes"`
+	}
+	err := c.doGet(ctx, "/pools/default", &resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Nodes, nil
+}
+
 type LocalInfo struct {
 	Status   string
 	OTPNode  string
